@@ -606,6 +606,7 @@ namespace slskd.Transfers.API
         [ProducesResponseType(503)]
         public async Task StreamDownloadAsync([FromRoute, UrlEncoded, Required] string username, [FromRoute, Required] string id, CancellationToken cancellationToken)
         {
+            Log.Debug("Stream request for download {Id} from {Username} (range: {Range})", id, username, Request.Headers.Range.ToString());
             if (Program.IsRelayAgent)
             {
                 Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -817,6 +818,9 @@ namespace slskd.Transfers.API
             {
                 stream?.Dispose();
             }
+
+            var served = position - range.From;
+            Log.Information("Stream request for download {Id} from {Username} finished with {Status} ({Served}/{Length} bytes)", id, username, Response.StatusCode, served, range.Length);
 
             if (position == range.From && !cancellationToken.IsCancellationRequested)
             {
