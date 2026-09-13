@@ -17,14 +17,18 @@ mode returns 403.
   with 404 if nothing was served instead of a short 200), then the finished file under the
   batch destination after the move. Full single-range support via `StreamRange`
   (`Transfers/API/TransferStreamRange.cs`); suffix ranges supported; multi-range rejected
-  with 416 + `Content-Range: bytes */total`.
+  with 416 + `Content-Range: bytes */total`. The route `{username}` must own the transfer
+  (case-insensitive, else 404). Responses carry the audio content type for the filename
+  extension (flac/mp3/m4a/ogg/opus/wav/aiff) so players sniff correctly. Entry and outcome
+  (range, status, bytes served) are logged. When the transfer just completed and the final
+  file is not resolvable yet, resolution is retried briefly before giving up.
 
 ## Behavior change
 
 - `Transfers/Downloads/DownloadService.cs`: incomplete files are created with
-  `FileShare.Read` (was `None`) so readers can stream concurrently; the writer still holds
-  exclusive write access. Path resolution factored into `GetIncompleteFilename()` shared by
-  the download flow and the stream endpoint.
+  `FileShare.ReadWrite | FileShare.Delete` (was `None`, then `Read`) so concurrent stream
+  readers neither block reads nor break the completion move on Windows. Path resolution
+  factored into `GetIncompleteFilename()` shared by the download flow and the stream endpoint.
 
 ## Tests
 
@@ -32,9 +36,11 @@ mode returns 403.
   200 byte-exact, `bytes=100-199` → 206 with exact `Content-Range`, over-range → 416,
   URL-safe base64 accepted.
 - `TransferStreamRangeTests` (12): full/suffix/clamped ranges, all 416 shapes, non-positive total.
-- `TransfersControllerStreamTests` (7): 400/404/416 shapes, full 200, partial 206,
-  post-move final-file serving, already-failed transfer → clean 404.
-- Full suite: 1317/1317 pass.
+
+- `TransfersControllerStreamTests` (9): 400/404/416 shapes, full 200, partial 206,
+  post-move final-file serving, already-failed transfer → clean 404, username mismatch
+  → 404, completed-but-unresolvable → brief re-resolve then clean 404.
+- Full suite: 1319/1319 pass.
 
 ## App contract notes (for the Metrolist client)
 

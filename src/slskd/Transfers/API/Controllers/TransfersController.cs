@@ -618,10 +618,11 @@ namespace slskd.Transfers.API
                 Response.StatusCode = StatusCodes.Status400BadRequest;
                 return;
             }
-
             var transfer = Transfers.Downloads.Find(t => t.Id == guid);
 
-            if (transfer == default || transfer.Size <= 0)
+            // the id alone must not authorize the stream: the route username has to own it
+            if (transfer == default || transfer.Size <= 0
+                || !string.Equals(transfer.Username, username, StringComparison.OrdinalIgnoreCase))
             {
                 Response.StatusCode = StatusCodes.Status404NotFound;
                 return;
@@ -680,7 +681,7 @@ namespace slskd.Transfers.API
             }
 
             Response.StatusCode = range.IsPartial ? StatusCodes.Status206PartialContent : StatusCodes.Status200OK;
-            Response.ContentType = "application/octet-stream";
+            Response.ContentType = ContentTypeForFilename(transfer.Filename);
             Response.Headers.AcceptRanges = "bytes";
 
             if (range.IsPartial)
@@ -716,7 +717,36 @@ namespace slskd.Transfers.API
 
                     var path = transfer == default ? null : ResolveServePath(transfer, incompleteFilename, batchDestination, downloadsRoot, out var growing);
 
-                    if (path == null)
+                    if (path == null && transfer != null && transfer.EndedAt != null
+                        && transfer.Exception == null && transfer.Size > 0
+                        && transfer.BytesTransferred >= transfer.Size)
+                    {
+                        // the incomplete file was just moved and the final file is not
+                        // resolvable yet: re-resolve briefly instead of truncating the
+                        // response (the clean-404 rewrite only covers zero-byte serves)
+                        const int maxResolveAttempts = 12;
+                        var resolved = false;
+
+                        for (var attempt = 0; attempt < maxResolveAttempts && !cancellationToken.IsCancellationRequested; attempt++)
+                        {
+                            await Task.Delay(500, cancellationToken);
+                            transfer = Transfers.Downloads.Find(t => t.Id == guid);
+                            lastRefresh = DateTime.UtcNow;
+                            path = transfer == default ? null : ResolveServePath(transfer, incompleteFilename, batchDestination, downloadsRoot, out growing);
+
+                            if (path != null)
+                            {
+                                resolved = true;
+                                break;
+                            }
+                        }
+
+                        if (!resolved)
+                        {
+                            break;
+                        }
+                    }
+                    else if (path == null)
                     {
                         break;
                     }
@@ -728,7 +758,10 @@ namespace slskd.Transfers.API
 
                         try
                         {
-                            stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                            // ReadWrite: the writer appends while we read. Delete: File.Move
+                            // needs delete access on Windows, or streaming a file across
+                            // completion would fail the download itself.
+                            stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                         }
                         catch (IOException)
                         {
@@ -831,6 +864,23 @@ namespace slskd.Transfers.API
                 Response.Headers.Remove("Content-Range");
                 Response.Headers.Remove("Accept-Ranges");
             }
+        }
+
+        private static string ContentTypeForFilename(string filename)
+        {
+            var extension = System.IO.Path.GetExtension(filename)?.TrimStart('.').ToLowerInvariant();
+
+            return extension switch
+            {
+                "flac" => "audio/flac",
+                "mp3" => "audio/mpeg",
+                "m4a" => "audio/mp4",
+                "ogg" or "oga" => "audio/ogg",
+                "opus" => "audio/ogg",
+                "wav" => "audio/wav",
+                "aiff" or "aif" => "audio/aiff",
+                _ => "application/octet-stream",
+            };
         }
 
         private static string ResolveServePath(Transfer transfer, string incompleteFilename, string batchDestination, string downloadsRoot, out bool growing)

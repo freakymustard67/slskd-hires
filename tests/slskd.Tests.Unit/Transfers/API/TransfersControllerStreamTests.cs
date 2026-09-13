@@ -160,6 +160,35 @@ public class TransfersControllerStreamTests : IDisposable
     }
 
     [Fact]
+    public async Task StreamDownloadAsync_Returns_404_Given_Username_Mismatch()
+    {
+        var transfer = SuccessfulTransfer(size: 256);
+        SetupTransfer(transfer, incompleteBytes: TestBytes(256));
+
+        var context = CreateContext(range: null);
+
+        await Controller.WithContext(context).StreamDownloadAsync("someone-else", transfer.Id.ToString(), CancellationToken.None);
+
+        Assert.Equal(404, context.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task StreamDownloadAsync_Returns_404_Given_Completed_Transfer_With_No_Resolvable_File()
+    {
+        // incomplete file was moved but the final file is not (yet) visible: the
+        // endpoint re-resolves briefly, then fails cleanly instead of truncating
+        var transfer = SuccessfulTransfer(size: 256);
+        SetupTransfer(transfer, incompleteBytes: null);
+
+        var (context, body) = CreateContextWithBody(range: null);
+
+        await Controller.WithContext(context).StreamDownloadAsync("user", transfer.Id.ToString(), CancellationToken.None);
+
+        Assert.Equal(404, context.Response.StatusCode);
+        Assert.Empty(body.ToArray());
+    }
+
+    [Fact]
     public async Task StreamDownloadAsync_Serves_Final_File_After_Move()
     {
         var bytes = TestBytes(256);

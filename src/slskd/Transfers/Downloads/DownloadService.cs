@@ -1412,7 +1412,7 @@ namespace slskd.Transfers.Downloads
                                     {
                                         Access = System.IO.FileAccess.Write,
                                         Mode = shouldResume ? System.IO.FileMode.Append : System.IO.FileMode.Create,
-                                        Share = System.IO.FileShare.Read, // allow concurrent readers (progressive streaming); writers still hold exclusive write access
+                                        Share = System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete, // concurrent stream readers must not block the completion move (Windows)
                                         UnixCreateMode = unixFileMode,
                                     })),
                             size: transfer.Size,
