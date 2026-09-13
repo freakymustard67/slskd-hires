@@ -1,0 +1,47 @@
+# Render free-tier blueprint for slskd-hires
+#
+# One-click deploy: Render dashboard → New → Blueprint → point at this repo.
+# Then set the `sync: false` env vars below in the dashboard (never commit secrets).
+#
+# FREE-TIER LIMITS (plan accordingly — this is a satellite, not a primary server):
+# - No persistent disks on free: /app (config, sqlite, downloads) is EPHEMERAL.
+#   Everything is lost on restart/redeploy/sleep. Keep the home server as the library.
+# - One HTTP port only: Soulseek inbound listen port (default 50300) is unreachable, so
+#   the client runs in PASSIVE mode — fewer peers can send to you, downloads are slower,
+#   expect more queueing and "File not shared" rejections.
+# - 512 MB RAM shared CPU: the image already tunes the GC for small heaps
+#   (see Dockerfile ENV), but large share scans can still OOM. Keep shares tiny/none.
+# - Sleeps when idle: Soulseek disconnects; first search after wake fails until reconnect.
+#   The Metrolist app surfaces this as the "not logged into Soulseek" message.
+
+services:
+  - type: web
+    name: slskd-hires
+    plan: free
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      # Render injects $PORT (default 10000); must match what slskd binds.
+      - key: SLSKD_HTTP_PORT
+        value: 10000
+      # Soulseek login (dashboard → Environment → add values).
+      - key: SLSKD_SLSK_USERNAME
+        sync: false
+      - key: SLSKD_SLSK_PASSWORD
+        sync: false
+      # Primary API key, tuple format from slskd docs:
+      #   role=ReadWrite;cidr=0.0.0.0/0,::/0;<16-255 char secret>
+      # Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+      - key: SLSKD_API_KEY
+        sync: false
+      # Ephemeral paths (no disks on free tier).
+      - key: SLSKD_DOWNLOADS_DIR
+        value: /app/downloads
+      - key: SLSKD_INCOMPLETE_DIR
+        value: /app/incomplete
+      - key: SLSKD_SHARED_DIR
+        value: /app/shares
+      # Quieter, cheaper idle behavior.
+      - key: SLSKD_NO_VERSION_CHECK
+        value: true

@@ -34,6 +34,7 @@ using Microsoft.Extensions.Options;
 
 namespace slskd.Files.API
 {
+    using System;
     using System.ComponentModel.DataAnnotations;
     using System.IO;
     using System.Security;
@@ -127,6 +128,77 @@ namespace slskd.Files.API
         [ProducesResponseType(204)]
         public Task<IActionResult> DeleteDownloadFileAsync([FromRoute] string base64FileName)
             => DeleteFileAsync(rootDirectory: OptionsSnapshot.Value.Directories.Downloads, base64FileName);
+
+        /// <summary>
+        ///     Downloads the specified file within the downloads directory, with support for Range requests.
+        /// </summary>
+        /// <param name="base64FilePath">The relative, base 64 (standard or URL-safe) encoded, path of the file to download.</param>
+        /// <returns></returns>
+        /// <response code="200">The request completed successfully.</response>
+        /// <response code="206">A partial range of the file was returned.</response>
+        /// <response code="400">The specified path was malformed.</response>
+        /// <response code="401">Authentication failed.</response>
+        /// <response code="403">Access to the specified file was denied.</response>
+        /// <response code="404">The specified file does not exist.</response>
+        /// <response code="416">The requested range is not satisfiable.</response>
+        [HttpGet("downloads/files/{base64FilePath}")]
+        [Authorize(Policy = AuthPolicy.Any)]
+        [ProducesResponseType(200)]
+        [ProducesResponseType(206)]
+        [ProducesResponseType(400)]
+        [ProducesResponseType(401)]
+        [ProducesResponseType(403)]
+        [ProducesResponseType(404)]
+        [ProducesResponseType(416)]
+        public IActionResult GetDownloadFile([FromRoute] string base64FilePath)
+        {
+            string relativePath;
+            try
+            {
+                // accept both standard and URL-safe base 64; URL-safe keeps the value to a single route segment
+                var normalized = base64FilePath.Replace('-', '+').Replace('_', '/');
+                normalized = normalized.PadRight(normalized.Length + ((4 - (normalized.Length % 4)) % 4), '=');
+                relativePath = normalized
+                    .FromBase64()
+                    .Replace('\\', Path.DirectorySeparatorChar)
+                    .Replace('/', Path.DirectorySeparatorChar)
+                    .TrimStart(Path.DirectorySeparatorChar);
+            }
+            catch (FormatException)
+            {
+                return BadRequest("The specified file path is not valid base 64");
+            }
+
+            var root = Path.GetFullPath(OptionsSnapshot.Value.Directories.Downloads);
+
+            string fullPath;
+            try
+            {
+                fullPath = Path.GetFullPath(FileSafety.CombineSafely(root, relativePath));
+            }
+            catch (ArgumentException ex)
+            {
+                Log.Warning("File download of '{Path}' rejected: {Message}", relativePath, ex.Message);
+                return BadRequest("The specified file path is invalid");
+            }
+
+            // backstop matching ListContentsAsync containment; CombineSafely already rejects traversal and
+            // absolute segments, but symlinks or edge cases must still resolve under the downloads directory
+            if (fullPath != root && !fullPath.StartsWith(root + Path.DirectorySeparatorChar))
+            {
+                Log.Warning("File download of '{File}' forbidden", fullPath);
+                return Forbid();
+            }
+
+            if (!System.IO.File.Exists(fullPath))
+            {
+                Log.Debug("File '{File}' not found", fullPath);
+                return NotFound();
+            }
+
+            Log.Debug("Sending file '{File}'", fullPath);
+            return PhysicalFile(fullPath, "application/octet-stream", enableRangeProcessing: true);
+        }
 
         /// <summary>
         ///     Lists the contents of the downloads directory.

@@ -35,6 +35,8 @@ using Microsoft.Extensions.Options;
 namespace slskd.Transfers.API
 {
     using System;
+    using System.Buffers;
+    using System.IO;
     using System.Collections.Generic;
     using System.ComponentModel.DataAnnotations;
     using System.Linq;
@@ -45,6 +47,7 @@ namespace slskd.Transfers.API
     using Microsoft.AspNetCore.Http;
     using Microsoft.AspNetCore.Mvc;
     using Serilog;
+    using Transfer = slskd.Transfers.Transfer;
     using slskd.Users;
     using Soulseek;
 
@@ -570,6 +573,298 @@ namespace slskd.Transfers.API
             }
 
             return Ok(download);
+        }
+
+        /// <summary>
+        ///     Streams the specified download, including while it is still in progress.
+        /// </summary>
+        /// <remarks>
+        ///     Serves the growing incomplete file during transfer (waiting for bytes as needed) and the
+        ///     final file after it completes, so one URL covers the whole lifecycle. Supports Range requests.
+        /// </remarks>
+        /// <param name="username">The username of the download source.</param>
+        /// <param name="id">The id of the download.</param>
+        /// <param name="cancellationToken">The token to monitor for client disconnect.</param>
+        /// <returns></returns>
+        /// <response code="200">The request completed successfully.</response>
+        /// <response code="206">A partial range of the file was returned.</response>
+        /// <response code="400">The specified id was malformed.</response>
+        /// <response code="401">Authentication failed.</response>
+        /// <response code="403">The request was forbidden.</response>
+        /// <response code="404">The specified download was not found.</response>
+        /// <response code="416">The requested range is not satisfiable.</response>
+        /// <response code="503">The file is temporarily unavailable.</response>
+        [HttpGet("downloads/stream/{username}/{id}")]
+        [Authorize(Policy = AuthPolicy.Any)]
+        [ProducesResponseType(200)]
+        [ProducesResponseType(206)]
+        [ProducesResponseType(400)]
+        [ProducesResponseType(401)]
+        [ProducesResponseType(403)]
+        [ProducesResponseType(404)]
+        [ProducesResponseType(416)]
+        [ProducesResponseType(503)]
+        public async Task StreamDownloadAsync([FromRoute, UrlEncoded, Required] string username, [FromRoute, Required] string id, CancellationToken cancellationToken)
+        {
+            if (Program.IsRelayAgent)
+            {
+                Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
+
+            if (!Guid.TryParse(id, out var guid))
+            {
+                Response.StatusCode = StatusCodes.Status400BadRequest;
+                return;
+            }
+
+            var transfer = Transfers.Downloads.Find(t => t.Id == guid);
+
+            if (transfer == default || transfer.Size <= 0)
+            {
+                Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+
+            var total = transfer.Size;
+
+            // the completed file lands under the batch destination; resolve it once for post-move serving
+            string batchDestination = null;
+
+            if (transfer.BatchId.HasValue && transfer.BatchId != Guid.Empty)
+            {
+                var batch = await Transfers.Downloads.Batches.FindAsync(b => b.Id == transfer.BatchId.Value);
+                batchDestination = batch?.Options?.Destination;
+            }
+
+            var downloadsRoot = Path.GetFullPath(OptionsSnapshot.Value.Directories.Downloads);
+            var incompleteFilename = Transfers.Downloads.GetIncompleteFilename(transfer.Username, transfer.Filename);
+
+            if (!StreamRange.TryParse(Request.Headers.Range, total, out var range, out var unsatisfiable) || unsatisfiable)
+            {
+                Response.StatusCode = StatusCodes.Status416RequestedRangeNotSatisfiable;
+                Response.Headers.ContentRange = $"bytes */{total}";
+                return;
+            }
+
+            // wait briefly for the first bytes so a just-enqueued transfer doesn't 404
+            var waitStart = DateTime.UtcNow;
+
+            while (!cancellationToken.IsCancellationRequested && (DateTime.UtcNow - waitStart).TotalSeconds < 60)
+            {
+                transfer = Transfers.Downloads.Find(t => t.Id == guid);
+
+                if (transfer == default || (transfer.EndedAt != null && transfer.Exception != null))
+                {
+                    Response.StatusCode = StatusCodes.Status404NotFound;
+                    return;
+                }
+
+                if (ResolveServePath(transfer, incompleteFilename, batchDestination, downloadsRoot, out _) != null)
+                {
+                    break;
+                }
+
+                if (transfer.EndedAt != null)
+                {
+                    break;
+                }
+
+                await Task.Delay(500, cancellationToken);
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            Response.StatusCode = range.IsPartial ? StatusCodes.Status206PartialContent : StatusCodes.Status200OK;
+            Response.ContentType = "application/octet-stream";
+            Response.Headers.AcceptRanges = "bytes";
+
+            if (range.IsPartial)
+            {
+                Response.Headers.ContentRange = $"bytes {range.From}-{range.To}/{total}";
+            }
+
+            Response.ContentLength = range.Length;
+            Response.Headers.CacheControl = "no-store";
+
+            const long chunkSize = 64 * 1024;
+            const int maxIdleSeconds = 120;
+
+            var position = range.From;
+            var idleSince = DateTime.UtcNow;
+            var lastRefresh = DateTime.MinValue;
+            long maxLengthSeen = 0;
+            FileStream stream = null;
+            string openPath = null;
+
+            try
+            {
+                while (position <= range.To)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // refresh transfer state when stalled or periodically; the file length is always read live
+                    if (transfer == default || (DateTime.UtcNow - lastRefresh).TotalSeconds > 2)
+                    {
+                        transfer = Transfers.Downloads.Find(t => t.Id == guid);
+                        lastRefresh = DateTime.UtcNow;
+                    }
+
+                    var path = transfer == default ? null : ResolveServePath(transfer, incompleteFilename, batchDestination, downloadsRoot, out var growing);
+
+                    if (path == null)
+                    {
+                        break;
+                    }
+
+                    if (openPath != path)
+                    {
+                        stream?.Dispose();
+                        stream = null;
+
+                        try
+                        {
+                            stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                        }
+                        catch (IOException)
+                        {
+                            await Task.Delay(500, cancellationToken);
+                            continue;
+                        }
+
+                        openPath = path;
+                    }
+
+                    long length;
+
+                    try
+                    {
+                        length = stream.Length;
+                    }
+                    catch (IOException)
+                    {
+                        stream.Dispose();
+                        stream = null;
+                        openPath = null;
+                        await Task.Delay(500, cancellationToken);
+                        continue;
+                    }
+
+                    // shrink under us means the writer restarted with overwrite; never serve a mix of contents
+                    if (length < maxLengthSeen)
+                    {
+                        break;
+                    }
+
+                    maxLengthSeen = Math.Max(maxLengthSeen, length);
+
+                    var available = Math.Min(range.To + 1, length) - position;
+
+                    if (available <= 0)
+                    {
+                        // refresh before deciding; the throttled state above may predate completion
+                        transfer = Transfers.Downloads.Find(t => t.Id == guid);
+                        lastRefresh = DateTime.UtcNow;
+
+                        var terminal = transfer == default || transfer.EndedAt != null;
+
+                        if (terminal || (DateTime.UtcNow - idleSince).TotalSeconds > maxIdleSeconds)
+                        {
+                            break;
+                        }
+
+                        await Task.Delay(500, cancellationToken);
+                        continue;
+                    }
+
+                    if (stream.Position != position)
+                    {
+                        stream.Seek(position, SeekOrigin.Begin);
+                    }
+
+                    var toRead = (int)Math.Min(chunkSize, available);
+                    var buffer = ArrayPool<byte>.Shared.Rent(toRead);
+
+                    try
+                    {
+                        var read = await stream.ReadAsync(buffer.AsMemory(0, toRead), cancellationToken);
+
+                        if (read == 0)
+                        {
+                            await Task.Delay(250, cancellationToken);
+                            continue;
+                        }
+
+                        await Response.Body.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                        await Response.Body.FlushAsync(cancellationToken);
+                        position += read;
+                        idleSince = DateTime.UtcNow;
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // client went away; nothing to do
+            }
+            finally
+            {
+                stream?.Dispose();
+            }
+
+            if (position == range.From && !cancellationToken.IsCancellationRequested)
+            {
+                // nothing was written, so headers aren't on the wire yet; fail cleanly
+                // instead of violating the declared content length
+                Response.StatusCode = StatusCodes.Status404NotFound;
+                Response.ContentLength = null;
+                Response.Headers.Remove("Content-Range");
+                Response.Headers.Remove("Accept-Ranges");
+            }
+        }
+
+        private static string ResolveServePath(Transfer transfer, string incompleteFilename, string batchDestination, string downloadsRoot, out bool growing)
+        {
+            growing = false;
+
+            if (System.IO.File.Exists(incompleteFilename))
+            {
+                growing = transfer == null || transfer.EndedAt == null;
+                return incompleteFilename;
+            }
+
+            // the incomplete file is moved on success; serve the final file under the batch destination
+            if (transfer != null && transfer.EndedAt != null && transfer.Exception == null && transfer.Size > 0
+                && transfer.BytesTransferred >= transfer.Size && !string.IsNullOrWhiteSpace(batchDestination))
+            {
+                var tail = FileSafety.GetFileNameSafely(transfer.Filename, sanitize: true);
+                string combined;
+
+                try
+                {
+                    combined = FileSafety.CombineSafely(downloadsRoot, batchDestination, tail);
+                }
+                catch (ArgumentException)
+                {
+                    return null;
+                }
+
+                var full = Path.GetFullPath(combined);
+
+                if (full != downloadsRoot && full.StartsWith(downloadsRoot + Path.DirectorySeparatorChar)
+                    && System.IO.File.Exists(full))
+                {
+                    return full;
+                }
+            }
+
+            return null;
         }
 
         /// <summary>

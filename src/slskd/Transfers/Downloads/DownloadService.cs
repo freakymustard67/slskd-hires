@@ -91,6 +91,17 @@ namespace slskd.Transfers.Downloads
         Task<string> DeriveDestination(Transfer transfer);
 
         /// <summary>
+        ///     Computes the fully qualified incomplete filename for the specified user and remote filename.
+        /// </summary>
+        /// <remarks>
+        ///     Shared by the download flow and the progressive streaming endpoint so both resolve identically.
+        /// </remarks>
+        /// <param name="username">The username of the remote user.</param>
+        /// <param name="remoteFilename">The remote filename, exactly as reported by the network.</param>
+        /// <returns>The fully qualified local incomplete filename.</returns>
+        string GetIncompleteFilename(string username, string remoteFilename);
+
+        /// <summary>
         ///     Enqueues the requested list of <paramref name="files"/>.
         /// </summary>
         /// <remarks>
@@ -757,7 +768,6 @@ namespace slskd.Transfers.Downloads
         /// </remarks>
         /// <param name="transfer">The transfer.</param>
         /// <returns>The derived destination directory.</returns>
-        /// <exception cref="SlskdException">Thrown if the derivation logic produces an absolute path, or one with traversal segments.</exception>
         public async Task<string> DeriveDestination(Transfer transfer)
         {
             // validation should ensure this is a relative path and that it contains no traversal segments
@@ -885,6 +895,25 @@ namespace slskd.Transfers.Downloads
             }
 
             return destination;
+        }
+
+        /// <summary>
+        ///     Computes the fully qualified incomplete filename for the specified user and remote filename.
+        /// </summary>
+        /// <remarks>
+        ///     Shared by the download flow and the progressive streaming endpoint so both resolve identically.
+        /// </remarks>
+        /// <param name="username">The username of the remote user.</param>
+        /// <param name="remoteFilename">The remote filename, exactly as reported by the network.</param>
+        /// <returns>The fully qualified local incomplete filename.</returns>
+        public string GetIncompleteFilename(string username, string remoteFilename)
+        {
+            var incompleteDirectory = OptionsMonitor.CurrentValue.Directories.Incomplete;
+            var sanitizedUsername = FileSafety.SanitizePathSegment(username);
+            var sanitizedFilename = FileSafety.GetFileNameSafely(remoteFilename, sanitize: true);
+            var sanitizedRemotePath = FileSafety.GetDirectoryNameSafely(remoteFilename, sanitize: true) ?? string.Empty;
+
+            return FileSafety.CombineSafely(incompleteDirectory, sanitizedUsername, sanitizedRemotePath, sanitizedFilename);
         }
 
         /// <summary>
@@ -1343,12 +1372,7 @@ namespace slskd.Transfers.Downloads
                     that are concerned about this (extremely unlikely) case should configure slskd to always overwrite
                     partial files.
                 */
-                var incompleteDirectory = OptionsMonitor.CurrentValue.Directories.Incomplete;
-                var sanitizedUsername = FileSafety.SanitizePathSegment(transfer.Username);
-                var sanitizedFilename = FileSafety.GetFileNameSafely(transfer.Filename, sanitize: true);
-                var sanitizedRemotePath = FileSafety.GetDirectoryNameSafely(transfer.Filename, sanitize: true) ?? string.Empty;
-
-                var incompleteFilename = FileSafety.CombineSafely(incompleteDirectory, sanitizedUsername, sanitizedRemotePath, sanitizedFilename);
+                var incompleteFilename = GetIncompleteFilename(transfer.Username, transfer.Filename);
 
                 Log.Debug("Incomplete file for {Filename} from {Username} will be: {IncompleteFilename}", FileSafety.GetFileNameSafely(transfer.Filename), transfer.Username, incompleteFilename);
 
@@ -1388,7 +1412,7 @@ namespace slskd.Transfers.Downloads
                                     {
                                         Access = System.IO.FileAccess.Write,
                                         Mode = shouldResume ? System.IO.FileMode.Append : System.IO.FileMode.Create,
-                                        Share = System.IO.FileShare.None, // exclusive access for the duration of the download
+                                        Share = System.IO.FileShare.Read, // allow concurrent readers (progressive streaming); writers still hold exclusive write access
                                         UnixCreateMode = unixFileMode,
                                     })),
                             size: transfer.Size,
