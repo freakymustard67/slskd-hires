@@ -1,0 +1,51 @@
+# Keep the Render free-tier service awake.
+#
+# Why external instead of self-ping: Render spins a free web service down after
+# 15 minutes without INBOUND traffic. A timer inside the service dies with the
+# service, so it can never wake it back up. An outside pinger every 10 minutes
+# keeps inbound traffic inside the window, which is the whole trick. If Render
+# ever enforces against this, the only symptom is the old 30-60s cold start;
+# the app already handles reconnect/disconnect states.
+#
+# Override the target without editing: repo Settings > Secrets and variables >
+# Actions > Variables > New repository variable named RENDER_URL.
+
+name: keepalive
+
+on:
+  schedule:
+    # every 10 minutes, comfortably inside Render's 15-minute idle window
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RENDER_URL: ${{ vars.RENDER_URL || 'https://slskd-hires.onrender.com' }}
+    steps:
+      - name: Ping health endpoint
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS --max-time 60 "$RENDER_URL/health"; then
+              echo
+              echo "awake (attempt $attempt)"
+              exit 0
+            fi
+            echo "attempt $attempt failed, retrying in 30s..."
+            sleep 30
+          done
+          echo "service did not answer after 5 attempts"
+          exit 1
+
+      - name: Prove the app layer answers
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 60 "$RENDER_URL/api/v0/session/enabled"
+          echo
